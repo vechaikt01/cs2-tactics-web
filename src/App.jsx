@@ -373,10 +373,23 @@ export default function TacticsBoard() {
   // Tích chọn ghim nhiều dòng: các dòng được tích sẽ dồn lên đầu, theo
   // đúng thứ tự người dùng tích (tích trước lên trước, tích sau lên sau);
   // những dòng không tích giữ nguyên thứ tự tương đối với nhau ở phía sau.
-  const handleApplyPinOrder = async (pinnedIds) => {
+  //
+  // `baseOrderIds` là thứ tự gốc (chụp lại ngay trước khi tích dòng đầu
+  // tiên trong một "đợt" ghim) — luôn dùng thứ tự gốc này để tính toán,
+  // thay vì thứ tự hiện tại (đã bị xáo bởi các lần ghim trước đó), để khi
+  // bỏ tích hết, danh sách quay lại đúng y vị trí ban đầu chứ không bị kẹt.
+  const handleApplyPinOrder = async (pinnedIds, baseOrderIds) => {
+    const source = baseOrderIds
+      ? baseOrderIds.map((id) => mapTactics.find((t) => t.id === id)).filter(Boolean)
+      : mapTactics;
+    if (pinnedIds.length === 0) {
+      // Bỏ tích hết: khôi phục nguyên trạng thứ tự gốc.
+      await persistTactics(applySubsetOrder(tactics, source));
+      return;
+    }
     const pinnedSet = new Set(pinnedIds);
-    const pinned = pinnedIds.map((id) => mapTactics.find((t) => t.id === id)).filter(Boolean);
-    const rest = mapTactics.filter((t) => !pinnedSet.has(t.id));
+    const pinned = pinnedIds.map((id) => source.find((t) => t.id === id)).filter(Boolean);
+    const rest = source.filter((t) => !pinnedSet.has(t.id));
     const reordered = [...pinned, ...rest];
     await persistTactics(applySubsetOrder(tactics, reordered));
   };
@@ -869,6 +882,9 @@ function TacticsTable({ tactics, onEdit, onDelete, onImage, onReorder, onApplyPi
   const [dragId, setDragId] = useState(null);
   const [overId, setOverId] = useState(null);
   const [pinnedOrder, setPinnedOrder] = useState([]); // ids theo đúng thứ tự đã tích chọn
+  // Thứ tự các dòng NGAY TRƯỚC khi bắt đầu tích dòng đầu tiên của một đợt
+  // ghim — dùng để khôi phục lại đúng vị trí ban đầu khi bỏ tích hết.
+  const baseOrderRef = useRef(null);
 
   const handleDragStart = (id) => (e) => {
     setDragId(id);
@@ -893,10 +909,19 @@ function TacticsTable({ tactics, onEdit, onDelete, onImage, onReorder, onApplyPi
   };
   const handlePinToggle = (id, checked) => {
     setPinnedOrder((prev) => {
+      // Bắt đầu một đợt ghim mới (chưa có dòng nào được tích) → chụp lại
+      // thứ tự hiện tại làm "gốc" để có thể khôi phục sau này.
+      if (checked && prev.length === 0) {
+        baseOrderRef.current = tactics.map((t) => t.id);
+      }
       const next = checked
         ? (prev.includes(id) ? prev : [...prev, id])
         : prev.filter((x) => x !== id);
-      onApplyPinOrder?.(next);
+      onApplyPinOrder?.(next, baseOrderRef.current);
+      if (next.length === 0) {
+        // Đã bỏ tích hết — đợt ghim kết thúc, xoá mốc gốc để đợt sau chụp lại.
+        baseOrderRef.current = null;
+      }
       return next;
     });
   };
