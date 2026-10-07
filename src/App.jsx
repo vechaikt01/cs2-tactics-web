@@ -1806,6 +1806,31 @@ function TacticRows({
   const [hoverPreview, setHoverPreview] = useState(null); // {src, caption, x, y}
   const assignments = tactic.assignments?.length ? tactic.assignments : [{ id: "_empty", role: "", videoUrls: [], note: "" }];
   const rowSpan = assignments.length;
+  // 1 role có thể ném nhiều nade (các dòng liền nhau cùng roleKey): ô "Role"
+  // gộp theo nhóm đó. roleSpans[i] > 0 = dòng đầu của nhóm (vẽ ô, rowSpan =
+  // số nade); 0 = dòng tiếp theo trong cùng nhóm (không vẽ ô Role nữa).
+  // nadeNos[i] = số thứ tự nade trong role, groupSizes[i] = số nade của role.
+  const roleSpans = [];
+  const nadeNos = [];
+  const groupSizes = [];
+  assignments.forEach((a, idx) => {
+    const key = a.roleKey || a.id;
+    const prevKey = idx > 0 ? (assignments[idx - 1].roleKey || assignments[idx - 1].id) : null;
+    if (idx > 0 && prevKey === key) {
+      roleSpans.push(0);
+      nadeNos.push(nadeNos[idx - 1] + 1);
+    } else {
+      let n = 1;
+      while (idx + n < assignments.length && (assignments[idx + n].roleKey || assignments[idx + n].id) === key) n += 1;
+      roleSpans.push(n);
+      nadeNos.push(1);
+    }
+  });
+  assignments.forEach((a, idx) => {
+    let start = idx;
+    while (start > 0 && roleSpans[start] === 0) start -= 1;
+    groupSizes.push(roleSpans[start]);
+  });
   const tdBase = { border: "1px solid #232B36", padding: "10px 12px", fontSize: 13, color: "#E8EAED", verticalAlign: "top" };
   const toggleVideo = (id) => setOpenVideos((prev) => ({ ...prev, [id]: !prev[id] }));
 
@@ -1928,9 +1953,26 @@ function TacticRows({
               </td>
             )}
 
-            <td style={tdBase}>{a.role || "—"}</td>
+            {roleSpans[i] > 0 && (
+              <td rowSpan={roleSpans[i]} style={{ ...tdBase, ...(roleSpans[i] > 1 ? { background: "#161B22", fontWeight: 600 } : {}) }}>
+                {a.role || "—"}
+              </td>
+            )}
 
             <td style={tdBase}>
+              {a.nadeType && (() => {
+                const nm = CATEGORY_META[a.nadeType];
+                const nlabel = NADE_TYPE_OPTIONS.find((o) => o.value === a.nadeType)?.label || a.nadeType;
+                return (
+                  <span style={{
+                    display: "inline-flex", alignItems: "center", gap: 5, marginBottom: 6, fontSize: 11, fontWeight: 700,
+                    color: nm?.color || "#B6BCC6", background: `${nm?.color || "#8A93A3"}22`, border: `1px solid ${nm?.color || "#8A93A3"}55`,
+                    borderRadius: 5, padding: "2px 7px",
+                  }}>
+                    {groupSizes[i] > 1 ? `Nade ${nadeNos[i]} · ` : ""}{nlabel}
+                  </span>
+                );
+              })()}
               {videos.length > 0 ? (
                 <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
                   {videos.map((v, vi) => {
@@ -2761,8 +2803,13 @@ function TacticForm({ initial, map, mapFloors, allTacticsOnMap, onCancel, onSave
       const ownImages = Array.isArray(a.images)
         ? a.images.map((img) => (typeof img === "string" ? { id: uid(), src: img, caption: "" } : { id: img.id || uid(), src: img.src, caption: img.caption || "" }))
         : [];
+      const aid = a.id || uid();
       return {
-        id: a.id || uid(),
+        id: aid,
+        // Các "nade" thuộc cùng 1 role dùng chung roleKey — 1 role có thể
+        // ném nhiều nade, mỗi nade có loại, vị trí, video, ghi chú, ảnh riêng.
+        // Dữ liệu cũ (không có roleKey) = mỗi role chỉ có 1 nade.
+        roleKey: a.roleKey || aid,
         role: a.role || "",
         note: a.note || "",
         videoUrls: Array.isArray(a.videoUrls) && a.videoUrls.length
@@ -2802,11 +2849,59 @@ function TacticForm({ initial, map, mapFloors, allTacticsOnMap, onCancel, onSave
   const updateAssignment = (id, field, value) => {
     setAssignments((prev) => prev.map((a) => (a.id === id ? { ...a, [field]: value } : a)));
   };
-  const addAssignment = () => setAssignments((prev) => [...prev, { id: uid(), role: "", videoUrls: [{ id: uid(), url: "", desc: "", fileData: "", fileName: "" }], note: "", images: [], nadeType: "", landAt: null, throwFrom: null, floorId: null }]);
+  const makeNade = (roleKey, role) => {
+    const id = uid();
+    return { id, roleKey: roleKey || id, role: role || "", videoUrls: [{ id: uid(), url: "", desc: "", fileData: "", fileName: "" }], note: "", images: [], nadeType: "", landAt: null, throwFrom: null, floorId: null };
+  };
+  // Thêm 1 role mới (kèm 1 nade trống).
+  const addAssignment = () => setAssignments((prev) => [...prev, makeNade()]);
+  // Thêm 1 nade nữa cho role đã có — chèn ngay sau nade cuối của role đó
+  // (các nade cùng role luôn nằm liền nhau để bảng gộp ô Role đúng).
+  const addNadeToRole = (roleKey) => setAssignments((prev) => {
+    let last = -1;
+    prev.forEach((a, idx) => { if (a.roleKey === roleKey) last = idx; });
+    if (last < 0) return prev;
+    const nade = makeNade(roleKey, prev[last].role);
+    return [...prev.slice(0, last + 1), nade, ...prev.slice(last + 1)];
+  });
+  // Đổi tên role = đổi cho mọi nade của role đó.
+  const updateRoleName = (roleKey, value) => {
+    setAssignments((prev) => prev.map((a) => (a.roleKey === roleKey ? { ...a, role: value } : a)));
+  };
+  // Xoá cả role (mọi nade của nó).
+  const removeRole = (roleKey) => {
+    setAssignments((prev) => prev.filter((a) => a.roleKey !== roleKey));
+    setPlacingFor((cur) => {
+      if (!cur) return cur;
+      return assignments.some((a) => a.id === cur.assignmentId && a.roleKey === roleKey) ? null : cur;
+    });
+  };
+  // Xoá 1 nade riêng lẻ trong role.
   const removeAssignment = (id) => {
     setAssignments((prev) => prev.filter((a) => a.id !== id));
     setPlacingFor((cur) => (cur?.assignmentId === id ? null : cur));
   };
+  // Nhóm theo role (giữ thứ tự xuất hiện) + nhãn hiển thị cho từng nade:
+  // role 1 chỉ 1 nade → "1"; role 1 có 3 nade → "1a", "1b", "1c".
+  const roleGroups = useMemo(() => {
+    const groups = [];
+    const byKey = new Map();
+    assignments.forEach((a) => {
+      let g = byKey.get(a.roleKey);
+      if (!g) { g = { key: a.roleKey, items: [] }; byKey.set(a.roleKey, g); groups.push(g); }
+      g.items.push(a);
+    });
+    return groups;
+  }, [assignments]);
+  const labelById = useMemo(() => {
+    const m = {};
+    roleGroups.forEach((g, gi) => {
+      g.items.forEach((a, ni) => {
+        m[a.id] = g.items.length > 1 ? `${gi + 1}${String.fromCharCode(97 + (ni % 26))}` : `${gi + 1}`;
+      });
+    });
+    return m;
+  }, [roleGroups]);
   const setAssignmentPoint = (assignmentId, field, value) => {
     setAssignments((prev) => prev.map((a) => (a.id === assignmentId ? { ...a, [field]: value } : a)));
   };
@@ -2817,6 +2912,17 @@ function TacticForm({ initial, map, mapFloors, allTacticsOnMap, onCancel, onSave
     setAssignments((prev) => prev.map((a) => (
       a.id === assignmentId ? { ...a, [field]: value, floorId: isMultiFloor ? pickerFloorId : a.floorId } : a
     )));
+  };
+
+  // Bấm "Đặt điểm rơi/đứng ném" trong thẻ nade: bật chế độ đặt cho nade đó
+  // rồi tự cuộn lên bản đồ thu nhỏ (nằm phía trên) để bấm chọn luôn.
+  const pickerSectionRef = useRef(null);
+  const startPlacing = (assignmentId, mode) => {
+    const same = placingFor?.assignmentId === assignmentId && placingFor?.mode === mode;
+    setPlacingFor(same ? null : { assignmentId, mode });
+    if (!same) {
+      setTimeout(() => pickerSectionRef.current?.scrollIntoView({ behavior: "smooth", block: "center" }), 50);
+    }
   };
 
   const updateVideoField = (assignmentId, videoId, field, value) => {
@@ -3191,6 +3297,7 @@ function TacticForm({ initial, map, mapFloors, allTacticsOnMap, onCancel, onSave
                 </div>
               )}
               <div
+                ref={pickerSectionRef}
                 onClick={handlePickerClick}
                 style={{
                   position: "relative", display: "inline-block", maxWidth: "100%", lineHeight: 0,
@@ -3261,22 +3368,22 @@ function TacticForm({ initial, map, mapFloors, allTacticsOnMap, onCancel, onSave
                       </svg>
                     )}
                     {a.landAt && (
-                      <div title={`Điểm rơi — role #${i + 1}${a.role ? `: ${a.role}` : ""}`} className="tac-mono" style={{
+                      <div title={`Điểm rơi — role #${labelById[a.id]}${a.role ? `: ${a.role}` : ""}`} className="tac-mono" style={{
                         position: "absolute", left: `${a.landAt.x}%`, top: `${a.landAt.y}%`, transform: "translate(-50%,-50%)",
                         width: 18, height: 18, borderRadius: "50%", background: "#E8D44D", border: "2px solid #0E1117",
                         boxShadow: "0 0 0 2px #E8D44D88", display: "flex", alignItems: "center", justifyContent: "center",
                         fontSize: 9.5, fontWeight: 700, color: "#0E1117",
                       }}>
-                        {i + 1}
+                        {labelById[a.id]}
                       </div>
                     )}
                     {a.throwFrom && (
-                      <div title={`Điểm đứng ném — role #${i + 1}${a.role ? `: ${a.role}` : ""}`} className="tac-mono" style={{
+                      <div title={`Điểm đứng ném — role #${labelById[a.id]}${a.role ? `: ${a.role}` : ""}`} className="tac-mono" style={{
                         position: "absolute", left: `${a.throwFrom.x}%`, top: `${a.throwFrom.y}%`, transform: "translate(-50%,-50%)",
                         width: 15, height: 15, borderRadius: "50%", background: "#5B9BD5", border: "2px solid #0E1117",
                         display: "flex", alignItems: "center", justifyContent: "center", fontSize: 9, fontWeight: 700, color: "#0E1117",
                       }}>
-                        {i + 1}
+                        {labelById[a.id]}
                       </div>
                     )}
                   </React.Fragment>
@@ -3305,29 +3412,43 @@ function TacticForm({ initial, map, mapFloors, allTacticsOnMap, onCancel, onSave
             </button>
           </div>
           <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-            {assignments.map((a, i) => (
-              <div key={a.id} style={{ background: "#0E1117", border: "1px solid #232B36", borderRadius: 9, padding: 12, position: "relative" }}>
-                {assignments.length > 1 && (
-                  <button onClick={() => removeAssignment(a.id)} style={{ position: "absolute", top: 8, right: 8, background: "none", border: "none", color: "#5C6573", cursor: "pointer" }}>
+            {roleGroups.map((g, gi) => (
+              <div key={g.key} style={{ background: "#0E1117", border: "1px solid #232B36", borderRadius: 9, padding: 12, position: "relative" }}>
+                {roleGroups.length > 1 && (
+                  <button onClick={() => removeRole(g.key)} title="Xoá role này (cùng mọi nade của nó)" style={{ position: "absolute", top: 8, right: 8, background: "none", border: "none", color: "#5C6573", cursor: "pointer" }}>
                     <X size={14} />
                   </button>
                 )}
-                <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10, paddingRight: roleGroups.length > 1 ? 22 : 0 }}>
                   <span className="tac-mono" title="Số thứ tự tương ứng với ghim trên bản đồ phía trên" style={{
                     flexShrink: 0, width: 20, height: 20, borderRadius: "50%", background: "#E8D44D22", border: "1px solid #E8D44D55",
                     color: "#E8D44D", fontSize: 10.5, fontWeight: 700, display: "flex", alignItems: "center", justifyContent: "center",
                   }}>
-                    {i + 1}
+                    {gi + 1}
                   </span>
                   <input
                     className="tac-input"
                     style={{ ...inputStyle, fontWeight: 600 }}
-                    value={a.role}
-                    onChange={(e) => updateAssignment(a.id, "role", e.target.value)}
-                    placeholder={`Role #${i + 1} (VD: Người đi site A)`}
+                    value={g.items[0].role}
+                    onChange={(e) => updateRoleName(g.key, e.target.value)}
+                    placeholder={`Role #${gi + 1} (VD: Người đi site A)`}
                   />
                 </div>
 
+                <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+                  {g.items.map((a, ni) => (
+                    <div key={a.id} style={{ background: "#141A22", border: "1px solid #232B36", borderRadius: 8, padding: 10, position: "relative" }}>
+                      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
+                        <span className="tac-mono" style={{ fontSize: 11, color: "#8A93A3", letterSpacing: "0.04em", textTransform: "uppercase" }}>
+                          Nade {g.items.length > 1 ? labelById[a.id] : "#1"}
+                          {a.nadeType ? ` · ${NADE_TYPE_OPTIONS.find((o) => o.value === a.nadeType)?.label || a.nadeType}` : ""}
+                        </span>
+                        {g.items.length > 1 && (
+                          <button onClick={() => removeAssignment(a.id)} title="Xoá nade này" style={{ background: "none", border: "none", color: "#5C6573", cursor: "pointer", padding: 0 }}>
+                            <X size={13} />
+                          </button>
+                        )}
+                      </div>
                 <div style={{ marginBottom: 8 }}>
                   <span style={{ fontSize: 11, color: "#5C6573", marginBottom: 4, display: "block" }}>Loại nade sẽ ném</span>
                   <select
@@ -3342,16 +3463,18 @@ function TacticForm({ initial, map, mapFloors, allTacticsOnMap, onCancel, onSave
                   </select>
                 </div>
 
-                {mapImageUrl && (
-                  <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 8 }}>
+                {/* Đặt điểm rơi / điểm đứng ném cho ĐÚNG nade này — luôn hiện ngay
+                    dưới ô "Loại nade"; chưa có ảnh sơ đồ thì mờ đi + báo lý do. */}
+                {(
+                  <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 8, alignItems: "center" }}>
                     <button
                       type="button"
-                      onClick={() => setPlacingFor(
-                        placingFor?.assignmentId === a.id && placingFor?.mode === "landAt" ? null : { assignmentId: a.id, mode: "landAt" }
-                      )}
+                      disabled={!mapImageUrl}
+                      onClick={() => startPlacing(a.id, "landAt")}
                       className="tac-chip"
                       style={{
-                        display: "flex", alignItems: "center", gap: 5, padding: "5px 10px", borderRadius: 7, cursor: "pointer", fontSize: 11.5,
+                        opacity: mapImageUrl ? 1 : 0.45,
+                        display: "flex", alignItems: "center", gap: 5, padding: "5px 10px", borderRadius: 7, cursor: mapImageUrl ? "pointer" : "not-allowed", fontSize: 11.5,
                         border: `1px solid ${placingFor?.assignmentId === a.id && placingFor?.mode === "landAt" ? "#E8D44D" : "#2A3340"}`,
                         background: placingFor?.assignmentId === a.id && placingFor?.mode === "landAt" ? "#E8D44D22" : "#161B22",
                         color: placingFor?.assignmentId === a.id && placingFor?.mode === "landAt" ? "#E8D44D" : "#B6BCC6",
@@ -3367,12 +3490,12 @@ function TacticForm({ initial, map, mapFloors, allTacticsOnMap, onCancel, onSave
                     )}
                     <button
                       type="button"
-                      onClick={() => setPlacingFor(
-                        placingFor?.assignmentId === a.id && placingFor?.mode === "throwFrom" ? null : { assignmentId: a.id, mode: "throwFrom" }
-                      )}
+                      disabled={!mapImageUrl}
+                      onClick={() => startPlacing(a.id, "throwFrom")}
                       className="tac-chip"
                       style={{
-                        display: "flex", alignItems: "center", gap: 5, padding: "5px 10px", borderRadius: 7, cursor: "pointer", fontSize: 11.5,
+                        opacity: mapImageUrl ? 1 : 0.45,
+                        display: "flex", alignItems: "center", gap: 5, padding: "5px 10px", borderRadius: 7, cursor: mapImageUrl ? "pointer" : "not-allowed", fontSize: 11.5,
                         border: `1px solid ${placingFor?.assignmentId === a.id && placingFor?.mode === "throwFrom" ? "#5B9BD5" : "#2A3340"}`,
                         background: placingFor?.assignmentId === a.id && placingFor?.mode === "throwFrom" ? "#5B9BD522" : "#161B22",
                         color: placingFor?.assignmentId === a.id && placingFor?.mode === "throwFrom" ? "#5B9BD5" : "#B6BCC6",
@@ -3385,6 +3508,9 @@ function TacticForm({ initial, map, mapFloors, allTacticsOnMap, onCancel, onSave
                       <button type="button" onClick={() => setAssignmentPoint(a.id, "throwFrom", null)} className="tac-iconbtn" style={{ fontSize: 11, color: "#5C6573", background: "transparent", border: "1px dashed #2A3340", borderRadius: 7, padding: "5px 9px", cursor: "pointer" }}>
                         Xoá điểm ném
                       </button>
+                    )}
+                    {!mapImageUrl && (
+                      <span style={{ fontSize: 11, color: "#5C6573" }}>Map {map} chưa có ảnh sơ đồ — thêm ảnh ở màn hình chính để đặt vị trí.</span>
                     )}
                   </div>
                 )}
@@ -3500,6 +3626,17 @@ function TacticForm({ initial, map, mapFloors, allTacticsOnMap, onCancel, onSave
                     </div>
                   )}
                 </div>
+                    </div>
+                  ))}
+                </div>
+
+                <button
+                  onClick={() => addNadeToRole(g.key)}
+                  className="tac-chip"
+                  style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 12, color: "#5B9BD5", background: "transparent", border: "1px dashed #2A3340", borderRadius: 7, padding: "6px 10px", marginTop: 10 }}
+                >
+                  <Plus size={12} /> Thêm nade cho role này
+                </button>
               </div>
             ))}
           </div>
