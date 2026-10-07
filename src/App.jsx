@@ -1587,6 +1587,7 @@ export default function TacticsBoard() {
           {/* Bản đồ Nade luôn hiển thị trước tiên */}
           <NadeMapView
             tactics={visibleTactics}
+            categoryFilter={categoryFilter}
             mapImageUrl={activeFloorObj?.url || ""}
             floors={floors}
             activeFloorId={activeFloorObj?.id || null}
@@ -2077,6 +2078,7 @@ function ImageHoverPreview({ preview }) {
 function NadeMapView({
   tactics, mapImageUrl, floors, activeFloorId, onChangeFloor, callouts, calloutsEnabled, onToggleCallouts,
   onAddCallout, onRemoveCallout, onMoveCallout, onRenameCallout, onRotateCallout, onResizeCallout, onJumpToTactic, onEditTactic,
+  categoryFilter,
 }) {
   const isMultiFloor = (floors || []).length > 1;
   const [activeSpot, setActiveSpot] = useState(null); // cluster object | null
@@ -2102,6 +2104,10 @@ function NadeMapView({
   // Đang sửa tên 1 callout đã có (mở từ menu chuột phải → "Đổi tên").
   const [renameTarget, setRenameTarget] = useState(null); // { id, x, y, label }
   const [editorText, setEditorText] = useState("");
+
+  // Đổi bộ lọc loại nade → đóng overlay điểm ném đang mở (ghim đó có thể
+  // đã bị lọc mất khỏi bản đồ).
+  useEffect(() => { setActiveSpot(null); }, [categoryFilter]);
 
   // Đóng menu chuột phải khi bấm ra ngoài.
   useEffect(() => {
@@ -2152,8 +2158,14 @@ function NadeMapView({
         });
       }
     });
+    // Lọc theo loại nade đang chọn ở thanh bên: chỉ giữ các điểm (role) có
+    // loại nade khớp — nên 1 chiến thuật vừa có smoke vừa có flash, khi chỉ
+    // chọn Flashbang thì chỉ hiện điểm của role ném flash trên bản đồ.
+    if (categoryFilter && categoryFilter.size > 0) {
+      return pts.filter((p) => (p._categories || []).some((c) => categoryFilter.has(c)));
+    }
     return pts;
-  }, [tactics]);
+  }, [tactics, categoryFilter, floors, activeFloorId, isMultiFloor]);
 
   // Gom các điểm (role) rơi gần nhau (trong vòng ~2.5%) thành 1 ghim duy
   // nhất trên bản đồ, giống cách csnades.gg nhóm nhiều biến thể của cùng
@@ -2694,6 +2706,35 @@ function TacticForm({ initial, map, mapFloors, allTacticsOnMap, onCancel, onSave
   const [pickerFloorId, setPickerFloorId] = useState(floors[0]?.id || null);
   const pickerFloorObj = floors.find((f) => f.id === pickerFloorId) || floors[0] || null;
   const mapImageUrl = pickerFloorObj?.url || "";
+  // Kích thước THỰC của ảnh đang hiển thị trong picker. Khung bao ngoài có
+  // thể rộng hơn ảnh (ảnh bị giới hạn theo chiều cao 60vh nên hẹp lại,
+  // còn khung vẫn giữ bề ngang cũ → thừa dải đen bên phải). Mọi toạ độ %
+  // phải tính theo ĐÚNG khung ảnh, không phải khung bao — nếu không, điểm
+  // lưu ở đây sẽ lệch (nhất là trục ngang) so với "Bản đồ Nade" chung.
+  const pickerImgRef = useRef(null);
+  const [pickerBox, setPickerBox] = useState(null); // { w, h }
+  const measurePicker = useCallback(() => {
+    const el = pickerImgRef.current;
+    if (!el) return;
+    const w = el.clientWidth;
+    const h = el.clientHeight;
+    if (!w || !h) return;
+    setPickerBox((cur) => (cur && cur.w === w && cur.h === h ? cur : { w, h }));
+  }, []);
+  useEffect(() => {
+    measurePicker();
+    const el = pickerImgRef.current;
+    let ro;
+    if (el && typeof ResizeObserver !== "undefined") {
+      ro = new ResizeObserver(measurePicker);
+      ro.observe(el);
+    }
+    window.addEventListener("resize", measurePicker);
+    return () => {
+      if (ro) ro.disconnect();
+      window.removeEventListener("resize", measurePicker);
+    };
+  }, [mapImageUrl, measurePicker]);
   const [side, setSide] = useState(initial?.side || "CT");
   const [name, setName] = useState(initial?.name || "");
   const [description, setDescription] = useState(initial?.description || "");
@@ -2965,9 +3006,18 @@ function TacticForm({ initial, map, mapFloors, allTacticsOnMap, onCancel, onSave
   // để các điểm trùng vị trí gom đúng thành 1 ghim trên "Bản đồ Nade".
   const handlePickerClick = (e) => {
     if (!placingFor) return;
-    const rect = e.currentTarget.getBoundingClientRect();
-    let x = Math.min(100, Math.max(0, ((e.clientX - rect.left) / rect.width) * 100));
-    let y = Math.min(100, Math.max(0, ((e.clientY - rect.top) / rect.height) * 100));
+    const imgEl = pickerImgRef.current;
+    if (!imgEl) return;
+    const r = imgEl.getBoundingClientRect();
+    // Vùng nội dung ảnh = bỏ viền 1px (clientLeft/Top), khớp với lớp phủ.
+    const left = r.left + imgEl.clientLeft;
+    const top = r.top + imgEl.clientTop;
+    const width = imgEl.clientWidth;
+    const height = imgEl.clientHeight;
+    // Bấm ra ngoài ảnh (vùng thừa của khung bao) → bỏ qua.
+    if (e.clientX < left || e.clientX > left + width || e.clientY < top || e.clientY > top + height) return;
+    let x = Math.min(100, Math.max(0, ((e.clientX - left) / width) * 100));
+    let y = Math.min(100, Math.max(0, ((e.clientY - top) / height) * 100));
     if (placingFor.mode === "landAt" && placingNadeType) {
       const SNAP = 3;
       const near = existingSpots.find((s) => s.category === placingNadeType && Math.hypot(s.x - x, s.y - y) <= SNAP);
@@ -3143,11 +3193,26 @@ function TacticForm({ initial, map, mapFloors, allTacticsOnMap, onCancel, onSave
               <div
                 onClick={handlePickerClick}
                 style={{
-                  position: "relative", display: "inline-block", maxWidth: "100%", borderRadius: 8, overflow: "hidden",
-                  border: "1px solid #2A3340", background: "#000", cursor: placingFor ? "crosshair" : "default", lineHeight: 0,
+                  position: "relative", display: "inline-block", maxWidth: "100%", lineHeight: 0,
+                  cursor: placingFor ? "crosshair" : "default",
                 }}
               >
-                <img src={mapImageUrl} alt="" style={{ display: "block", maxWidth: "100%", maxHeight: "60vh", pointerEvents: "none" }} />
+                <img
+                  ref={pickerImgRef}
+                  src={mapImageUrl}
+                  alt=""
+                  onLoad={measurePicker}
+                  style={{
+                    display: "block", maxWidth: "100%", maxHeight: "60vh", pointerEvents: "none",
+                    borderRadius: 8, border: "1px solid #2A3340", background: "#000", boxSizing: "content-box",
+                  }}
+                />
+
+                {/* Lớp phủ khớp CHÍNH XÁC với khung ảnh (không phải khung bao) —
+                    mọi marker bên trong dùng % theo lớp này, giống hệt cách
+                    "Bản đồ Nade" vẽ trên ảnh. */}
+                {pickerBox && (
+                <div style={{ position: "absolute", left: 1, top: 1, width: pickerBox.w, height: pickerBox.h, pointerEvents: "none", overflow: "hidden", borderRadius: 7 }}>
 
                 {/* Điểm rơi ĐÃ CÓ từ các chiến thuật khác, theo từng loại
                     nade — mờ đi để làm nền tham khảo; khi đang đặt điểm rơi
@@ -3169,6 +3234,7 @@ function TacticForm({ initial, map, mapFloors, allTacticsOnMap, onCancel, onSave
                         border: `1.5px solid ${meta ? meta.color : "#5C6573"}`,
                         opacity: isSnapTarget ? 1 : (placingFor ? 0.25 : 0.55),
                         cursor: isSnapTarget ? "pointer" : "default",
+                        pointerEvents: isSnapTarget ? "auto" : "none",
                         display: "flex", alignItems: "center", justifyContent: "center",
                         fontSize: isSnapTarget ? 10.5 : 9, fontWeight: 700, color: "#0E1117",
                         boxShadow: isSnapTarget ? `0 0 0 3px ${meta.color}44` : "none",
@@ -3216,6 +3282,8 @@ function TacticForm({ initial, map, mapFloors, allTacticsOnMap, onCancel, onSave
                   </React.Fragment>
                   );
                 })}
+                </div>
+                )}
               </div>
               <div style={{ fontSize: 11, color: "#5C6573" }}>
                 {placingFor
