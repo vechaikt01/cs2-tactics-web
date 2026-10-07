@@ -921,6 +921,28 @@ export default function TacticsBoard() {
     await persistMapCallouts(next);
   };
 
+  // Xoay chữ của 1 callout: đổi qua lại giữa nằm NGANG (0°) và nằm DỌC
+  // (90°) — giống các tên khu vực dài (vd "Long", "Catwalk") trên radar
+  // gốc thường được xoay dọc để nằm vừa theo hành lang hẹp.
+  // Xoay tự do 1 callout (giữ chuột trái rồi kéo quanh tâm) — lưu số độ
+  // chính xác thay vì chỉ 2 trạng thái ngang/dọc.
+  const handleRotateCallout = async (id, rotation) => {
+    const list = mapCallouts[calloutMapKey] !== undefined
+      ? mapCallouts[calloutMapKey]
+      : (DEFAULT_CALLOUTS[calloutMapKey] || []);
+    const next = { ...mapCallouts, [calloutMapKey]: list.map((c) => (c.id === id ? { ...c, rotation } : c)) };
+    await persistMapCallouts(next);
+  };
+
+  // Phóng to / thu nhỏ riêng 1 callout (kéo núm nhỏ ở góc).
+  const handleResizeCallout = async (id, scale) => {
+    const list = mapCallouts[calloutMapKey] !== undefined
+      ? mapCallouts[calloutMapKey]
+      : (DEFAULT_CALLOUTS[calloutMapKey] || []);
+    const next = { ...mapCallouts, [calloutMapKey]: list.map((c) => (c.id === id ? { ...c, scale } : c)) };
+    await persistMapCallouts(next);
+  };
+
   const countsByMap = useMemo(() => {
     const c = {};
     tactics.forEach((t) => { c[t.map] = (c[t.map] || 0) + 1; });
@@ -1576,6 +1598,8 @@ export default function TacticsBoard() {
             onRemoveCallout={handleRemoveCallout}
             onMoveCallout={handleMoveCallout}
             onRenameCallout={handleRenameCallout}
+            onRotateCallout={handleRotateCallout}
+            onResizeCallout={handleResizeCallout}
             onJumpToTactic={handleJumpToTactic}
             onEditTactic={(t) => { setEditing(t); setFormOpen(true); }}
           />
@@ -2052,7 +2076,7 @@ function ImageHoverPreview({ preview }) {
 --------------------------------------------------------- */
 function NadeMapView({
   tactics, mapImageUrl, floors, activeFloorId, onChangeFloor, callouts, calloutsEnabled, onToggleCallouts,
-  onAddCallout, onRemoveCallout, onMoveCallout, onRenameCallout, onJumpToTactic, onEditTactic,
+  onAddCallout, onRemoveCallout, onMoveCallout, onRenameCallout, onRotateCallout, onResizeCallout, onJumpToTactic, onEditTactic,
 }) {
   const isMultiFloor = (floors || []).length > 1;
   const [activeSpot, setActiveSpot] = useState(null); // cluster object | null
@@ -2061,7 +2085,14 @@ function NadeMapView({
   // Kéo-thả callout: toạ độ % hiện tại trong lúc kéo (ghi đè callouts[].x/y
   // chỉ để vẽ — vị trí thật chỉ được lưu khi thả chuột ra).
   const [dragState, setDragState] = useState(null); // { id, x, y }
-  const didDragRef = useRef(false);
+  // Giữ chuột trái (không di chuyển) trong 1 khoảng ngắn trên 1 callout →
+  // chuyển sang CHẾ ĐỘ XOAY: kéo quanh tâm để xoay chữ tự do (thay vì kéo
+  // để di chuyển như bình thường). Click-kéo ngay (không giữ) vẫn là di
+  // chuyển như cũ.
+  const [rotatingId, setRotatingId] = useState(null);
+  const [rotateDraft, setRotateDraft] = useState(null); // { id, rotation }
+  // Kéo núm nhỏ ở góc callout để phóng to/thu nhỏ riêng callout đó.
+  const [resizeDraft, setResizeDraft] = useState(null); // { id, scale }
   // Ô nhập tên khi vừa đặt 1 điểm callout mới (không dùng window.prompt —
   // bị một số môi trường hiển thị chặn, khiến "Thêm callout" không có tác
   // dụng gì khi bấm vào bản đồ).
@@ -2174,28 +2205,119 @@ function NadeMapView({
   // Bắt đầu kéo 1 callout đã có. Chỉ cho kéo khi KHÔNG ở chế độ "đặt callout
   // mới", để tránh xung đột thao tác. Chuột trái (không kéo) giờ không làm
   // gì cả — xoá/đổi tên chỉ thực hiện qua menu chuột phải.
+  // Giữ chuột trái ~350ms mà KHÔNG di chuyển → vào chế độ xoay; nếu di
+  // chuyển ngay (trước khi giữ đủ lâu) → vẫn là kéo-để-di-chuyển như cũ.
+  //
+  // LƯU Ý quan trọng (lỗi đã sửa): ngưỡng "coi là đã bắt đầu kéo" trong lúc
+  // đang giữ chờ xoay KHÔNG được quá nhỏ — tay người cầm chuột giữ yên vẫn
+  // tự nhiên rung/lệch vài pixel trong 300-400ms, nên nếu ngưỡng chỉ 4px
+  // thì hầu như lần giữ nào cũng bị tính nhầm thành "kéo di chuyển" trước
+  // khi bộ đếm giờ xoay kịp chạy → không bao giờ vào được chế độ xoay.
+  // Giờ dùng 2 ngưỡng tách biệt: rung nhẹ trong lúc giữ (<= HOLD_JITTER_PX)
+  // không huỷ xoay; chỉ một cú kéo rõ ràng, nhanh (> DRAG_CANCEL_PX ngay từ
+  // đầu, trước khi đủ thời gian giữ) mới chuyển thẳng sang di chuyển.
+  const ROTATE_HOLD_MS = 320;
+  const HOLD_JITTER_PX = 6;
+  const DRAG_CANCEL_PX = 16;
   const handleCalloutMouseDown = (e, callout) => {
     if (calloutPicking || e.button !== 0) return;
     e.preventDefault();
     e.stopPropagation();
-    didDragRef.current = false;
+    let mode = null; // null (chưa quyết định) | "move" | "rotate"
     const startX = e.clientX;
     const startY = e.clientY;
-    setDragState({ id: callout.id, x: callout.x, y: callout.y });
+
+    const getCenterPx = () => {
+      const rect = mapImgRef.current.getBoundingClientRect();
+      return { cx: rect.left + (callout.x / 100) * rect.width, cy: rect.top + (callout.y / 100) * rect.height };
+    };
+
+    const startRotate = () => {
+      mode = "rotate";
+      clearTimeout(holdTimer);
+      setDragState(null);
+      setRotatingId(callout.id);
+      setRotateDraft({ id: callout.id, rotation: callout.rotation || 0 });
+    };
+
+    const holdTimer = setTimeout(() => {
+      if (mode === null) startRotate();
+    }, ROTATE_HOLD_MS);
 
     const onMove = (ev) => {
-      if (!didDragRef.current && (Math.abs(ev.clientX - startX) > 4 || Math.abs(ev.clientY - startY) > 4)) {
-        didDragRef.current = true;
+      const dist = Math.hypot(ev.clientX - startX, ev.clientY - startY);
+      if (mode === "rotate") {
+        const { cx, cy } = getCenterPx();
+        const angle = (Math.atan2(ev.clientY - cy, ev.clientX - cx) * 180) / Math.PI + 90;
+        setRotateDraft({ id: callout.id, rotation: Math.round(angle) });
+        return;
       }
-      const { x, y } = clientToPercent(ev.clientX, ev.clientY);
-      setDragState({ id: callout.id, x, y });
+      if (mode === null) {
+        if (dist > DRAG_CANCEL_PX) {
+          // Kéo rõ ràng, nhanh ngay từ đầu → chuyển hẳn sang di chuyển.
+          mode = "move";
+          clearTimeout(holdTimer);
+          setDragState({ id: callout.id, x: callout.x, y: callout.y });
+        } else if (dist > HOLD_JITTER_PX) {
+          // Lệch hơn mức rung tay bình thường nhưng chưa tới ngưỡng kéo
+          // hẳn — vẫn coi là đang giữ chờ xoay, chỉ cập nhật preview vị
+          // trí (chưa commit di chuyển).
+          return;
+        }
+        return;
+      }
+      if (mode === "move") {
+        const { x, y } = clientToPercent(ev.clientX, ev.clientY);
+        setDragState({ id: callout.id, x, y });
+      }
     };
     const onUp = (ev) => {
+      clearTimeout(holdTimer);
       document.removeEventListener("mousemove", onMove);
       document.removeEventListener("mouseup", onUp);
-      const { x, y } = clientToPercent(ev.clientX, ev.clientY);
-      setDragState(null);
-      if (didDragRef.current) onMoveCallout(callout.id, x, y);
+      if (mode === "rotate") {
+        setRotatingId(null);
+        setRotateDraft((cur) => {
+          if (cur && cur.id === callout.id) onRotateCallout(callout.id, cur.rotation);
+          return null;
+        });
+        return;
+      }
+      if (mode === "move") {
+        const { x, y } = clientToPercent(ev.clientX, ev.clientY);
+        setDragState(null);
+        onMoveCallout(callout.id, x, y);
+      }
+      // mode === null: nhả chuột ra trước khi đủ thời gian giữ và không kéo
+      // đủ xa → chỉ là 1 cú click thường, không làm gì cả.
+    };
+    document.addEventListener("mousemove", onMove);
+    document.addEventListener("mouseup", onUp);
+  };
+
+  // Kéo núm nhỏ ở góc 1 callout để phóng to/thu nhỏ riêng callout đó —
+  // tỉ lệ dựa theo khoảng cách từ tâm callout tới con trỏ chuột.
+  const handleResizeMouseDown = (e, callout) => {
+    e.preventDefault();
+    e.stopPropagation();
+    const rect = mapImgRef.current.getBoundingClientRect();
+    const centerX = rect.left + (callout.x / 100) * rect.width;
+    const centerY = rect.top + (callout.y / 100) * rect.height;
+    const startDist = Math.hypot(e.clientX - centerX, e.clientY - centerY) || 1;
+    const startScale = callout.scale || 1;
+
+    const onMove = (ev) => {
+      const dist = Math.hypot(ev.clientX - centerX, ev.clientY - centerY);
+      const nextScale = Math.min(3, Math.max(0.5, +((startScale * dist) / startDist).toFixed(2)));
+      setResizeDraft({ id: callout.id, scale: nextScale });
+    };
+    const onUp = () => {
+      document.removeEventListener("mousemove", onMove);
+      document.removeEventListener("mouseup", onUp);
+      setResizeDraft((cur) => {
+        if (cur && cur.id === callout.id) onResizeCallout(callout.id, cur.scale);
+        return null;
+      });
     };
     document.addEventListener("mousemove", onMove);
     document.addEventListener("mouseup", onUp);
@@ -2295,28 +2417,45 @@ function NadeMapView({
 
         {calloutsEnabled && callouts.map((c) => {
           const isDragging = dragState && dragState.id === c.id;
+          const isRotating = rotatingId === c.id && rotateDraft;
+          const isResizing = resizeDraft && resizeDraft.id === c.id;
           const pos = isDragging ? dragState : c;
+          const rotation = isRotating ? rotateDraft.rotation : (c.rotation || 0);
+          const scale = isResizing ? resizeDraft.scale : (c.scale || 1);
+          const active = isDragging || isRotating || isResizing;
           return (
             <div
               key={c.id}
               onMouseDown={(e) => handleCalloutMouseDown(e, c)}
               onContextMenu={(e) => handleCalloutContextMenu(e, c)}
-              title="Kéo để di chuyển — bấm chuột phải để đổi tên / xoá"
+              title="Kéo để di chuyển — giữ chuột rồi kéo để xoay — bấm chuột phải để đổi tên / xoá"
               className="tac-mono"
               style={{
-                position: "absolute", left: `${pos.x}%`, top: `${pos.y}%`, transform: "translate(-50%,-50%)",
-                fontSize: 10.5, color: "#E8EAED", background: isDragging ? "rgba(91,155,213,0.85)" : "rgba(14,17,23,0.78)",
-                border: `1px solid ${isDragging ? "#5B9BD5" : "#3A4456"}`,
+                position: "absolute", left: `${pos.x}%`, top: `${pos.y}%`,
+                transform: `translate(-50%,-50%) rotate(${rotation}deg) scale(${scale})`,
+                fontSize: 10.5, color: "#E8EAED", background: active ? "rgba(91,155,213,0.85)" : "rgba(14,17,23,0.78)",
+                border: `1px solid ${active ? "#5B9BD5" : "#3A4456"}`,
                 borderRadius: 5, padding: "2px 7px", whiteSpace: "nowrap", cursor: calloutPicking ? "default" : "grab",
                 // Khi đang ở chế độ "Thêm callout", tắt pointer-events trên các
                 // nhãn đã có để click luôn xuyên qua tới ảnh bản đồ bên dưới —
                 // nếu không, bấm gần như ở đâu cũng trúng 1 nhãn có sẵn thay vì
                 // đặt điểm mới.
                 pointerEvents: calloutPicking ? "none" : "auto",
-                userSelect: "none", zIndex: isDragging ? 5 : 1,
+                userSelect: "none", zIndex: active ? 5 : 1,
               }}
             >
               {c.label}
+              {/* Núm nhỏ ở góc dưới-phải — kéo để phóng to/thu nhỏ riêng callout này */}
+              {!calloutPicking && (
+                <div
+                  onMouseDown={(e) => handleResizeMouseDown(e, c)}
+                  title="Kéo để phóng to / thu nhỏ"
+                  style={{
+                    position: "absolute", right: -5, bottom: -5, width: 9, height: 9, borderRadius: "50%",
+                    background: "#5B9BD5", border: "1px solid #0E1117", cursor: "nwse-resize",
+                  }}
+                />
+              )}
             </div>
           );
         })}
@@ -2523,7 +2662,7 @@ function NadeMapView({
       </div>
       {calloutsEnabled && (
         <div style={{ marginTop: 8, fontSize: 11, color: "#5C6573" }}>
-          Bấm "Thêm callout" rồi chọn 1 điểm trên bản đồ, nhập tên và bấm ✓ — kéo 1 callout đã có để di chuyển nó, hoặc bấm chuột phải để Đổi tên / Xoá.
+          Bấm "Thêm callout" rồi chọn 1 điểm trên bản đồ, nhập tên và bấm ✓ — kéo 1 callout để di chuyển, giữ chuột rồi kéo để xoay, kéo núm nhỏ ở góc để phóng to/thu nhỏ, hoặc bấm chuột phải để Đổi tên / Xoá.
         </div>
       )}
 
